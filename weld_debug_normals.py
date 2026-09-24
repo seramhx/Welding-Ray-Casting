@@ -27,6 +27,9 @@ from weldfinal import (
     _surface_point_and_normal,
     _mesh_facet_point_and_normal,
     face_surface_type_str,
+    component_id_per_face,
+    tag_component_ids,
+    add_scene_mesh,
 )
 from weldfinal_assembly import pick_edge_manually
 
@@ -218,7 +221,7 @@ def render_debug(mesh, face1_idx, face2_idx, weld_seam, data, mesh_check=None, a
         arrow_mag = 0.04 * bbox_diagonal(mesh)
 
     pl = pv.Plotter(window_size=[1200, 900])
-    pl.add_mesh(mesh, color="lightgray", opacity=0.3)
+    add_scene_mesh(pl, mesh, opacity=0.3)
     pl.add_mesh(face1_pv, color="red", opacity=0.45, label=f"Face(s) {idx1}")
     pl.add_mesh(face2_pv, color="blue", opacity=0.45, label=f"Face(s) {idx2}")
 
@@ -292,6 +295,11 @@ def main():
 
     tagged_mesh = build_face_tagged_mesh(
         args.step, faces, args.minh, args.maxh, args.curvature, force_remesh=args.force_remesh)
+
+    component_of_face, n_components = component_id_per_face(shape, faces)
+    if n_components > 1:
+        tag_component_ids(tagged_mesh, component_of_face)
+        print(f"{n_components} component(s) detected -- shown in different colors.")
 
     print("\nOpening interactive window: left-click two adjacent faces to inspect the weld joint.")
     face1, face2, face1_idx, face2_idx = pick_two_faces(tagged_mesh, faces, face_groups)

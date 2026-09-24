@@ -1,553 +1,393 @@
 import argparse
-from collections import deque
+import itertools
+import math
 
 import numpy as np
-import pyvista as pv
-from scipy.spatial import KDTree
-
-from OCC.Core.BRepExtrema import BRepExtrema_DistShapeShape
 from OCC.Extend.TopologyUtils import TopologyExplorer
 
 from weldfinal import (
     load_step,
     build_face_tagged_mesh,
-    build_face_normal_mesh,
     find_cylinder_face_groups,
     report_cylinder_groups,
-    pick_two_faces,
-    find_shared_edges,
-    assemble_edge_chains,
-    sample_edge_with_bisector,
-    compute_group_normal_signs_by_raycast,
-    apply_normal_sign_correction,
-    _id_to_face_index,
-    _sample_edge_polyline,
-    _sample_chain_polyline,
     bbox_diagonal,
+    cast_ray_bundle_with_clearance,
+    prompt_for_clearance_rings,
+    rotate_about_axis,
+)
+from weld_line_finder import (
+    identify_components,
+    collect_candidate_edges_assembly,
+    resolve_assembly_chain_faces,
+    find_weld_lines_interactive,
+    visualize_weld_line_accessibility,
 )
 
-COMPONENT_CMAP = "tab10"
+# Full brute-force enumeration (every ordering gets its own full report) is used up to this many
+# weld lines; beyond it the factorial blow-up makes printing (and even just iterating) every
+# ordering impractical, so only the guaranteed-optimal sequence is found, via a subset DP.
+MAX_FULL_ENUMERATION = 8
+
+# TEMPORARY MANUAL OVERRIDE -- set back to 0.0 to fully revert to testing the pure bisector.
+# Nonzero: every accessibility check in the search tests a ray tilted this many degrees up/down
+# (work angle, rotated about each point's own tangent -- same convention as weld_angle_updown.py)
+# instead of the ideal bisector. Positive/negative sign picks which side it tilts toward.
+MANUAL_TEST_TILT_DEG = 0
 
 
-
-def identify_components(shape):
-    solids = list(TopologyExplorer(shape).solids())
-    faces, component_of_face = [], []
-    for comp_idx, solid in enumerate(solids):
-        solid_faces = list(TopologyExplorer(solid).faces())
-        faces.extend(solid_faces)
-        component_of_face.extend([comp_idx] * len(solid_faces))
-    return solids, faces, component_of_face
+def _test_directions(wl):
+    """The ray direction(s) actually tested for a weld line -- the bisector, unless
+    MANUAL_TEST_TILT_DEG overrides it. Used by both the search (SequenceEvaluator.cost) and the
+    optional final visualization, so the two can never silently disagree with each other."""
+    if MANUAL_TEST_TILT_DEG == 0:
+        return wl["bisectors"]
+    return rotate_about_axis(wl["bisectors"], wl["tangents"], MANUAL_TEST_TILT_DEG)
 
 
-def add_component_ids(tagged_mesh, component_of_face):
-    face_ids = tagged_mesh.cell_data["FaceID"]
-    lookup = np.array(component_of_face, dtype=np.int32)
-    tagged_mesh.cell_data["ComponentID"] = lookup[face_ids]
-    return tagged_mesh
-
-
-
-def confirm_or_retry(pick_fn, describe=None, max_attempts=10):
-    result = None
-    for _attempt in range(max_attempts):
-        result = pick_fn()
-        desc = describe(result) if describe else str(result)
-        raw = input(f"Confirm: {desc}? [Y/n]: ").strip().lower()
-        if raw in ("", "y", "yes"):
-            return result
-        print("Retrying that selection...")
-    print("Max retry attempts reached -- using the last selection.")
-    return result
-
-
-def pick_component(mesh, component_of_face, title, highlight_color="gold"):
-    picked = []
-    pl = pv.Plotter(window_size=[1100, 850])
-    pl.add_mesh(mesh, scalars="ComponentID", cmap=COMPONENT_CMAP, show_edges=True,
-                edge_color="dimgray", show_scalar_bar=False)
-    pl.add_text(title, font_size=11, color="black")
-
-    def on_pick(picked_sub):
-        if picked_sub is None or picked_sub.n_cells == 0:
-            return
-        fid = int(picked_sub.cell_data["FaceID"][0])
-        comp_idx = component_of_face[fid]
-        picked.clear()
-        picked.append(comp_idx)
-        sub = mesh.extract_cells(mesh.cell_data["ComponentID"] == comp_idx)
-        pl.add_mesh(sub, color=highlight_color, name="picked_component")
-        print(f"Picked component #{comp_idx}")
-
-    pl.enable_element_picking(callback=on_pick, mode="cell", left_clicking=True, show_message=False)
-    pl.show()
-
-    return picked[0] if picked else None
-
-
-def build_edge_pick_index(solids, n_per_edge=12):
-    all_edges = []
-    sample_pts = []
-    owner_of_sample = []
-    for comp_idx, solid in enumerate(solids):
-        for edge in TopologyExplorer(solid).edges():
-            edge_idx = len(all_edges)
-            all_edges.append((edge, comp_idx))
-            poly = _sample_edge_polyline(edge, n=n_per_edge)
-            sample_pts.append(poly)
-            owner_of_sample.extend([edge_idx] * len(poly))
-    sample_pts = np.vstack(sample_pts).astype(np.float64)
-    tree = KDTree(sample_pts)
-    return all_edges, tree, np.array(owner_of_sample, dtype=np.int32)
-
-
-def pick_edge_interactive(mesh, all_edges, tree, owner_of_sample, title):
-    picked = []
-    pl = pv.Plotter(window_size=[1100, 850])
-    pl.add_mesh(mesh, scalars="ComponentID", cmap=COMPONENT_CMAP, show_edges=True,
-                edge_color="dimgray", opacity=0.85, show_scalar_bar=False)
-    pl.add_text(title, font_size=11, color="black")
-
-    def on_pick(*_args):
-        point = pl.picked_point
-        if point is None:
-            return
-        _, idx = tree.query(point)
-        edge_idx = int(owner_of_sample[idx])
-        picked.clear()
-        picked.append(edge_idx)
-        edge, comp_idx = all_edges[edge_idx]
-        poly = _sample_edge_polyline(edge, n=30)
-        pl.add_lines(poly, color="magenta", width=6, connected=True, name="picked_edge")
-        print(f"Picked edge on component #{comp_idx}. Close the window to continue.")
-
-    pl.enable_surface_point_picking(callback=on_pick, left_clicking=True, show_message=False)
-    pl.show()
-
-    if not picked:
-        return None
-    return all_edges[picked[0]]
-
-
-def resolve_line_faces(mesh, faces, face_groups, edge, comp_solid):
-    auto_faces = list(TopologyExplorer(comp_solid).faces_from_edge(edge))
-    if len(auto_faces) == 2:
-        print("(This edge already borders 2 faces of its own component -- "
-              "click them again if that's the correct pair, or click faces from "
-              "a different component if this is really an inter-component joint.)")
-    print("Click the two faces adjacent to this weld line, then close the window.")
-    face1, face2, idx1, idx2 = pick_two_faces(mesh, faces, face_groups, base_scalars="ComponentID")
-    return face1, face2, idx1, idx2
-
-
-def resolve_weld_line_chain(topo, edge, face1, face2):
-    shared = find_shared_edges(topo, face1, face2)
-    if not shared:
-        return [(edge, False)]
-
-    chains = assemble_edge_chains(shared)
-    for chain, _is_closed in chains:
-        if any(e.IsSame(edge) for e, _ in chain):
-            return chain
-    return [(edge, False)]
-
-
-def _face_group_key(fid, face_groups):
-    return tuple(sorted(face_groups.get(fid, [fid])))
-
-
-def _shapes_within(shape_a, shape_b, tol):
-    tool = BRepExtrema_DistShapeShape(shape_a, shape_b)
-    return tool.IsDone() and tool.Value() < tol
-
-
-def find_component_pair_contacts(comp_a_idx, comp_b_idx, component_of_face, faces, face_groups, tol=1e-3):
-    faces_a = [i for i, c in enumerate(component_of_face) if c == comp_a_idx]
-    faces_b = [i for i, c in enumerate(component_of_face) if c == comp_b_idx]
-
-    groups_a = {_face_group_key(i, face_groups) for i in faces_a}
-    groups_b = {_face_group_key(i, face_groups) for i in faces_b}
-
-    contacts = []
-    for group_a in groups_a:
-        for group_b in groups_b:
-            close = any(_shapes_within(faces[ia], faces[ib], tol) for ia in group_a for ib in group_b)
-            if close:
-                contacts.append((list(group_a), list(group_b)))
-    return contacts
-
-
-def extract_group_contact_chains(faces, group_a, group_b, comp_solid_a, tol=1e-3):
-    contact_edges = []
-    seen = set()
-    for ia in group_a:
-        for e in TopologyExplorer(comp_solid_a).edges_from_face(faces[ia]):
-            if id(e) in seen:
-                continue
-            if any(_shapes_within(e, faces[ib], tol) for ib in group_b):
-                contact_edges.append(e)
-                seen.add(id(e))
-    return assemble_edge_chains(contact_edges) if contact_edges else []
-
-
-def scan_component_pair_weld_lines(faces, component_of_face, solids, face_groups, comp_a_idx, comp_b_idx, tol=1e-3):
-    contacts = find_component_pair_contacts(comp_a_idx, comp_b_idx, component_of_face, faces, face_groups, tol)
-    candidates = []
-    for group_a, group_b in contacts:
-        chains = extract_group_contact_chains(faces, group_a, group_b, solids[comp_a_idx], tol)
-        for chain, _closed in chains:
-            candidates.append({
-                "chain": chain,
-                "face1": [faces[i] for i in group_a], "face2": [faces[i] for i in group_b],
-                "face1_idx": group_a, "face2_idx": group_b,
-                "comp_a": comp_a_idx, "comp_b": comp_b_idx,
-            })
-    return candidates
-
-
-def preview_and_select_segments(mesh, candidate_lines):
-    palette = ["lime", "cyan", "yellow", "orange", "magenta", "red", "blue", "white"]
-    pl = pv.Plotter(window_size=[1100, 850])
-    pl.add_mesh(mesh, color="lightgray", opacity=0.5)
-    for i, wl in enumerate(candidate_lines):
-        poly = _sample_chain_polyline(wl["chain"])
-        color = palette[i % len(palette)]
-        pl.add_lines(poly, color=color, width=5, connected=True, label=f"[{i}]")
-        mid = poly[len(poly) // 2]
-        pl.add_point_labels([mid], [str(i)], font_size=18, text_color=color, shape=None)
-    pl.add_legend()
-    pl.add_title("Additional contact segments found -- note which to keep, then close the window",
-                 font_size=11)
-    pl.show()
-
-    raw = input(f"Add which segments? [all/none/comma-separated indices 0-{len(candidate_lines) - 1}]: ").strip().lower()
-    if raw in ("all", "a", ""):
-        return list(range(len(candidate_lines)))
-    if raw in ("none", "no", "n"):
-        return []
+def prompt_num_samples(default=15):
+    raw = input(f"Number of sample points to test per weld line [{default}]: ").strip()
+    if not raw:
+        return default
     try:
-        return sorted(set(int(x) for x in raw.replace(" ", "").split(",") if x != ""))
+        value = int(raw)
+        return value if value > 0 else default
     except ValueError:
-        print("Couldn't parse that -- adding none.")
-        return []
+        print(f"Couldn't parse that -- using default ({default}).")
+        return default
 
 
-def _add_weld_line(weld_lines, line_data, comp_a, comp_b, note_suffix=""):
-    label = f"WeldLine{len(weld_lines) + 1}"
-    line_data["label"] = label
-    weld_lines.append(line_data)
-    n_pieces = len(line_data["chain"])
-    loop_note = f" ({n_pieces} edge piece(s), auto-assembled into a loop)" if n_pieces > 1 else ""
-    print(f"{label} recorded: connects component {comp_a} <-> component {comp_b}{loop_note}{note_suffix}")
+def weld_own_other_components(weld_lines, component_of_face):
+    """Each weld line's own/other component is constant across all its pieces by construction
+    (resolve_assembly_chain_faces asks for the other component exactly once per weld line and
+    enforces a single own component), so the first piece's faces are enough to read it off."""
+    pairs = []
+    for wl in weld_lines:
+        own_face, other_face = wl["per_piece_faces"][0][0][0], wl["per_piece_faces"][0][1][0]
+        pairs.append((component_of_face[own_face], component_of_face[other_face]))
+    return pairs
 
 
-def collect_weld_lines(mesh, faces, face_groups, all_edges, tree, owner_of_sample, component_of_face, solids, topo):
-    weld_lines = []
-    while True:
-        raw = input("\nAdd weld lines between two components? [Y/n to finish]: ").strip().lower()
-        if raw in ("n", "no"):
-            break
+def weld_label(idx, own_comp, other_comp):
+    return f"W{idx}(comp{own_comp}<->comp{other_comp})"
 
-        comp_a = confirm_or_retry(
-            lambda: pick_component(mesh, component_of_face,
-                                    "Left-click any face of the FIRST component, then close the window.",
-                                    highlight_color="gold"),
-            describe=lambda c: f"component #{c}" if c is not None else "nothing picked")
-        comp_b = confirm_or_retry(
-            lambda: pick_component(mesh, component_of_face,
-                                    "Left-click any face of the SECOND component, then close the window.",
-                                    highlight_color="cyan"),
-            describe=lambda c: f"component #{c}" if c is not None else "nothing picked")
-        if comp_a is None or comp_b is None or comp_a == comp_b:
-            print("Need two distinct components -- try again.")
-            continue
 
-        print(f"\nScanning for contact regions between component {comp_a} and component {comp_b}...")
-        candidates = scan_component_pair_weld_lines(faces, component_of_face, solids, face_groups, comp_a, comp_b)
-        print(f"Found {len(candidates)} candidate weld line(s).")
+class SequenceEvaluator:
+    """Ray-casts each weld line only against the components physically present at that point in
+    a candidate sequence, memoized by (present-component-set, weld) so the same physical
+    situation is never ray-cast twice even when it recurs across many different orderings.
 
-        if candidates:
-            chosen = preview_and_select_segments(mesh, candidates)
-            for k in chosen:
-                _add_weld_line(weld_lines, candidates[k], comp_a, comp_b, note_suffix=" (auto-detected)")
+    A point only counts as accessible if the bisector ray AND every clearance-ring ray around it
+    are clear (see cast_ray_bundle_with_clearance) -- the same spherical-tool simulation already
+    used by the other scripts' visualizations -- so the search itself accounts for the torch
+    having a real radius, not just an infinitely thin ray, instead of only checking that
+    afterward in the optional final visualization."""
 
-        while True:
-            raw2 = input(f"\nManually add another weld line between component {comp_a} "
-                         f"and component {comp_b} (e.g. if the scan missed one)? [y/N]: ").strip().lower()
-            if raw2 not in ("y", "yes"):
-                break
+    def __init__(self, tagged_mesh, weld_lines, own_other_components, baseline_present, near_tol,
+                 n_rings=0, clearance_radius=5.0, ring_offset=None):
+        self.tagged_mesh = tagged_mesh
+        self.weld_lines = weld_lines
+        self.own_other = own_other_components
+        self.baseline_present = frozenset(baseline_present)
+        self.near_tol = near_tol
+        self.n_rings = n_rings
+        self.clearance_radius = clearance_radius
+        self.ring_offset = ring_offset
+        self.max_dist = bbox_diagonal(tagged_mesh)
+        self._mesh_cache = {}
+        self._cost_cache = {}
 
-            picked = confirm_or_retry(
-                lambda: pick_edge_interactive(
-                    mesh, all_edges, tree, owner_of_sample,
-                    "Left-click near the weld line, then close the window."),
-                describe=lambda p: f"edge on component #{p[1]}" if p else "nothing picked")
-            if picked is None:
-                print("No edge picked -- try again.")
+    def obstruction_mesh(self, present_components):
+        key = frozenset(present_components)
+        mesh = self._mesh_cache.get(key)
+        if mesh is None:
+            mask = np.isin(self.tagged_mesh.cell_data["ComponentID"], list(key))
+            mesh = self.tagged_mesh.extract_cells(mask).extract_surface()
+            self._mesh_cache[key] = mesh
+        return mesh
+
+    def cost(self, weld_idx, present_components):
+        key = (frozenset(present_components), weld_idx)
+        cached = self._cost_cache.get(key)
+        if cached is not None:
+            return cached
+        wl = self.weld_lines[weld_idx]
+        mesh = self.obstruction_mesh(present_components)
+        directions = _test_directions(wl)
+        combined_accessible, _center, _center_hits, _ring_acc, _ring_hits, _ring_o, _ring_d = \
+            cast_ray_bundle_with_clearance(
+                mesh, wl["points"], directions, self.max_dist, self.near_tol,
+                self.n_rings, self.clearance_radius, ring_offset=self.ring_offset)
+        n_blocked = int((~combined_accessible).sum())
+        result = (n_blocked, len(wl["points"]))
+        self._cost_cache[key] = result
+        return result
+
+    def evaluate_sequence(self, order):
+        present = set(self.baseline_present)
+        steps = []
+        total_blocked = 0
+        for widx in order:
+            own, other = self.own_other[widx]
+            present.add(own); present.add(other)
+            n_blocked, n_total = self.cost(widx, present)
+            total_blocked += n_blocked
+            steps.append({
+                "weld": widx, "present": sorted(present),
+                "n_blocked": n_blocked, "n_total": n_total, "is_full": n_blocked == 0,
+            })
+
+        # A joint between two bodies that had to be entered as several disconnected weld-line
+        # pieces (non-continuous edges can't be one pick) is judged as ONE unit here: it only
+        # counts toward fully_count if EVERY one of its pieces -- wherever each lands in the
+        # sequence -- ends up with zero blocked rays. Otherwise a joint split into many small,
+        # individually-clear pieces would inflate this count against an equally-good joint that
+        # just happened to be pickable as a single piece.
+        blocked_by_pair = {}
+        for step in steps:
+            key = frozenset(self.own_other[step["weld"]])
+            blocked_by_pair[key] = blocked_by_pair.get(key, 0) + step["n_blocked"]
+        fully_count = sum(1 for n in blocked_by_pair.values() if n == 0)
+
+        return {"order": list(order), "steps": steps, "fully_count": fully_count, "total_blocked": total_blocked}
+
+
+def _score(result):
+    # Sort key: maximize fully_count (priority 1), then minimize total_blocked (priority 2).
+    return (-result["fully_count"], result["total_blocked"])
+
+
+def enumerate_all_sequences(evaluator, n_welds):
+    return [evaluator.evaluate_sequence(order) for order in itertools.permutations(range(n_welds))]
+
+
+def find_optimal_via_dp(evaluator, n_welds):
+    """Subset DP (Held-Karp style): dp[mask] = best (total_blocked, backpointer) for having
+    completed exactly the welds in `mask`, in the best order found so far. Used instead of brute
+    force once n_welds exceeds MAX_FULL_ENUMERATION, since factorial enumeration becomes
+    impractical -- this still finds the exact, guaranteed order minimizing total blocked rays, in
+    O(2^n * n).
+
+    This optimizes total_blocked only, NOT the grouped fully_count metric (priority 1) that the
+    brute-force path uses: fully_count depends on ALL of a body-pair's pieces being 0-blocked,
+    wherever each piece lands in the sequence, so it isn't a quantity that can be built up one
+    weld at a time the way an incremental DP requires (a partial prefix can't know yet whether a
+    pair it has only partly placed will end up fully accessible). It's still reported correctly
+    for the resulting order via evaluate_sequence() below -- just not the search objective for
+    this fallback path -- so at this scale the two priorities can't both be exactly guaranteed
+    optimal simultaneously; total blocked rays is treated as the more scalable proxy."""
+    n = n_welds
+    present_of_mask = [None] * (1 << n)
+    present_of_mask[0] = frozenset(evaluator.baseline_present)
+    for mask in range(1, 1 << n):
+        lsb = mask & (-mask)
+        i = lsb.bit_length() - 1
+        prev_mask = mask & ~lsb
+        own, other = evaluator.own_other[i]
+        present_of_mask[mask] = present_of_mask[prev_mask] | {own, other}
+
+    # dp[mask] = (total_blocked, last_weld, prev_mask)
+    dp = [None] * (1 << n)
+    dp[0] = (0, None, None)
+    for mask in range(1, 1 << n):
+        best = None
+        for i in range(n):
+            if not (mask & (1 << i)):
                 continue
-            edge, edge_comp_idx = picked
+            prev_mask = mask & ~(1 << i)
+            prev_blocked, _, _ = dp[prev_mask]
+            n_blocked, _n_total = evaluator.cost(i, present_of_mask[mask])
+            cand_blocked = prev_blocked + n_blocked
+            if best is None or cand_blocked < best[0]:
+                best = (cand_blocked, i, prev_mask)
+        dp[mask] = best
 
-            face1, face2, idx1, idx2 = confirm_or_retry(
-                lambda: resolve_line_faces(mesh, faces, face_groups, edge, solids[edge_comp_idx]),
-                describe=lambda r: f"faces {r[2]} <-> {r[3]}")
-
-            chain = resolve_weld_line_chain(topo, edge, face1, face2)
-            line_data = {
-                "chain": chain,
-                "face1": face1, "face2": face2,
-                "face1_idx": idx1, "face2_idx": idx2,
-                "comp_a": comp_a, "comp_b": comp_b,
-            }
-            _add_weld_line(weld_lines, line_data, comp_a, comp_b, note_suffix=" (manual)")
-
-    return weld_lines
-
-
-
-def compute_weld_line_rays(tagged_mesh, weld_line, num_samples):
-    face1, face2 = weld_line["face1"], weld_line["face2"]
-    idx1, idx2 = weld_line["face1_idx"], weld_line["face2_idx"]
-    mesh_fallback1 = build_face_normal_mesh(tagged_mesh, idx1)
-    mesh_fallback2 = build_face_normal_mesh(tagged_mesh, idx2)
-
-    pts, n1_arr, n2_arr, bis_arr, tan_arr, owner1_ids, owner2_ids = sample_edge_with_bisector(
-        weld_line["chain"], face1, face2, num_samples=num_samples,
-        mesh_fallback1=mesh_fallback1, mesh_fallback2=mesh_fallback2)
-
-    signs1 = compute_group_normal_signs_by_raycast(mesh_fallback1, pts, n1_arr, owner1_ids)
-    signs2 = compute_group_normal_signs_by_raycast(mesh_fallback2, pts, n2_arr, owner2_ids)
-    n1_arr = apply_normal_sign_correction(n1_arr, owner1_ids, signs1)
-    n2_arr = apply_normal_sign_correction(n2_arr, owner2_ids, signs2)
-
-    bis = n1_arr + n2_arr
-    bis_norms = np.linalg.norm(bis, axis=1, keepdims=True)
-    bis_norms[bis_norms < 1e-6] = 1.0
-    bis_arr = bis / bis_norms
-
-    weld_line["pts"] = pts
-    weld_line["bisector"] = bis_arr
-    return weld_line
-
-
-def precompute_hits(tagged_mesh, weld_line, max_dist, near_tol=0.5):
-    comp_ids = tagged_mesh.cell_data["ComponentID"]
-    hit_lists = []
-    for pt, d in zip(weld_line["pts"], weld_line["bisector"]):
-        start = pt + d * near_tol
-        end = pt + d * max_dist
-        hit_pts, hit_cells = tagged_mesh.ray_trace(start, end, first_point=False)
-        if len(hit_pts) == 0:
-            hit_lists.append([])
-            continue
-        dists = np.linalg.norm(hit_pts - start, axis=1)
-        order = np.argsort(dists)
-        hits = [(float(dists[k]), int(comp_ids[hit_cells[k]])) for k in order]
-        hit_lists.append(hits)
-    weld_line["hit_lists"] = hit_lists
-    return weld_line
-
-
-
-def is_line_accessible(weld_line, installed_components):
-    relevant = installed_components | {weld_line["comp_a"], weld_line["comp_b"]}
-    for hits in weld_line["hit_lists"]:
-        for _dist, comp_id in hits:
-            if comp_id in relevant:
-                return False
-    return True
-
-
-def compute_precedence_constraints(weld_lines, base_component):
-    baseline_set = {base_component}
-    always_infeasible = [wl["label"] for wl in weld_lines if not is_line_accessible(wl, baseline_set)]
-
-    feasible_lines = [wl for wl in weld_lines if wl["label"] not in always_infeasible]
-    constraints = []
-    for wl_j in feasible_lines:
-        for wl_i in feasible_lines:
-            if wl_i is wl_j:
-                continue
-            installed_with_i_only = baseline_set | {wl_i["comp_a"], wl_i["comp_b"]}
-            if not is_line_accessible(wl_j, installed_with_i_only):
-                constraints.append((wl_j["label"], wl_i["label"]))
-
-    return always_infeasible, constraints
-
-
-def _topological_order(labels, constraints):
-    graph = {l: set() for l in labels}
-    indeg = {l: 0 for l in labels}
-    for j, i in constraints:
-        if j not in graph or i not in graph:
-            continue
-        if i not in graph[j]:
-            graph[j].add(i)
-            indeg[i] += 1
-
-    queue = deque(sorted(l for l in labels if indeg[l] == 0))
+    full_mask = (1 << n) - 1
     order = []
-    indeg_work = dict(indeg)
-    while queue:
-        n = queue.popleft()
-        order.append(n)
-        for m in sorted(graph[n]):
-            indeg_work[m] -= 1
-            if indeg_work[m] == 0:
-                queue.append(m)
+    mask = full_mask
+    while mask:
+        _, last_weld, prev_mask = dp[mask]
+        order.append(last_weld)
+        mask = prev_mask
+    order.reverse()
 
-    return order if len(order) == len(labels) else None
+    return evaluator.evaluate_sequence(order)
 
 
-def backtracking_search(weld_lines, base_component):
-    order = []
-
-    def dfs(installed, remaining):
-        if not remaining:
-            return list(order)
-        for k in remaining:
-            wl = weld_lines[k]
-            if is_line_accessible(wl, installed):
-                order.append(wl["label"])
-                rest = [r for r in remaining if r != k]
-                result = dfs(installed | {wl["comp_a"], wl["comp_b"]}, rest)
-                if result is not None:
-                    return result
-                order.pop()
-        return None
-
-    result = dfs({base_component}, list(range(len(weld_lines))))
-    return result, result is not None
+def print_sequence_report(result, evaluator, own_other, title):
+    print(f"\n--- {title} ---")
+    print(f"Order: {' -> '.join(weld_label(w, *own_other[w]) for w in result['order'])}")
+    for step in result["steps"]:
+        status = "OK (0 blocked)" if step["is_full"] else f"BLOCKED {step['n_blocked']}/{step['n_total']}"
+        print(f"  {weld_label(step['weld'], *own_other[step['weld']])}: present components "
+              f"{step['present']} -> {status}")
+    print(f"  Summary: {result['fully_count']} body-pair joint(s) fully accessible (all their "
+          f"piece(s) combined), {result['total_blocked']} blocked ray(s) total")
 
 
-def find_valid_sequence(weld_lines, constraints, base_component, feasible_labels):
-    by_label = {wl["label"]: wl for wl in weld_lines}
-    feasible_lines = [by_label[l] for l in feasible_labels]
-
-    order = _topological_order(feasible_labels, constraints)
-    if order is not None:
-        installed = {base_component}
-        valid = True
-        for label in order:
-            wl = by_label[label]
-            if not is_line_accessible(wl, installed):
-                valid = False
-                break
-            installed |= {wl["comp_a"], wl["comp_b"]}
-        if valid:
-            return order, True
-
-    return backtracking_search(feasible_lines, base_component)
+def print_ranked_summary(results, own_other, optimal):
+    print("\n" + "=" * 78)
+    print("ALL SEQUENCES RANKED (best first)")
+    print("=" * 78)
+    header = f"{'Rank':<5}{'Order':<45}{'PairsOK':<9}{'Blocked':<9}{'vs optimal'}"
+    print(header)
+    for rank, result in enumerate(sorted(results, key=_score), start=1):
+        order_str = ",".join(f"W{w}" for w in result["order"])
+        d_fully = result["fully_count"] - optimal["fully_count"]
+        d_blocked = result["total_blocked"] - optimal["total_blocked"]
+        delta = "OPTIMAL" if result is optimal or (d_fully == 0 and d_blocked == 0) else \
+            f"{d_fully:+d} fully-OK, {d_blocked:+d} blocked"
+        print(f"{rank:<5}{order_str:<45}{result['fully_count']:<9}{result['total_blocked']:<9}{delta}")
+    print("=" * 78)
 
 
+def run_sequence_search(tagged_mesh, weld_lines, own_other, baseline_present, near_tol,
+                         max_full_enum=MAX_FULL_ENUMERATION, n_rings=0, clearance_radius=5.0,
+                         ring_offset=None):
+    n = len(weld_lines)
+    evaluator = SequenceEvaluator(tagged_mesh, weld_lines, own_other, baseline_present, near_tol,
+                                   n_rings=n_rings, clearance_radius=clearance_radius,
+                                   ring_offset=ring_offset)
+    if n_rings > 0:
+        effective_offset = ring_offset if ring_offset is not None else clearance_radius
+        print(f"Simulating a spherical tool of radius {clearance_radius:.1f} mm via {n_rings} "
+              f"clearance ring ray(s) per point (start offset {effective_offset:.1f} mm forward "
+              f"along each ray) for every accessibility check in the search.")
 
-def report_sequence(weld_lines, base_component_idx, always_infeasible, constraints, sequence, ok):
-    print("\n" + "=" * 70)
-    print("WELD SEQUENCE PLANNING SUMMARY")
-    print("=" * 70)
-    print(f"Base component            : #{base_component_idx}")
-    print(f"Weld lines                : {len(weld_lines)}")
-
-    if always_infeasible:
-        print(f"\nAlways obstructed (no sequence position fixes these): {always_infeasible}")
-
-    if constraints:
-        print("\nPrecedence constraints found:")
-        for j, i in constraints:
-            print(f"  '{j}' must be welded before '{i}'")
+    if n <= max_full_enum:
+        print(f"\nEvaluating all {n}! = {math.factorial(n)} possible weld order(s)...")
+        results = enumerate_all_sequences(evaluator, n)
+        optimal = min(results, key=_score)
+        for result in sorted(results, key=_score):
+            title = "OPTIMAL SEQUENCE" if result is optimal else "Sequence"
+            print_sequence_report(result, evaluator, own_other, title)
+        print_ranked_summary(results, own_other, optimal)
     else:
-        print("\nNo precedence constraints -- the feasible lines are order-independent.")
+        print(f"\n{n} weld lines -> {n}! orderings is too many to enumerate and print individually "
+              f"(limit is {max_full_enum}, set with --max_full_enum). Finding the order that "
+              f"minimizes total blocked rays via an exact subset search instead (guaranteed optimal "
+              f"for that criterion; the number of fully-accessible body-pair joints is reported "
+              f"below for the result but wasn't the search objective at this scale -- see "
+              f"find_optimal_via_dp).")
+        optimal = find_optimal_via_dp(evaluator, n)
+        print_sequence_report(optimal, evaluator, own_other, "OPTIMAL SEQUENCE")
+        results = [optimal]
 
-    if ok:
-        print("\nExample valid sequence:")
-        for idx, label in enumerate(sequence, 1):
-            print(f"  {idx}. {label}")
-    else:
-        print("\nNo fully valid sequence found (conflicting/cyclic constraints).")
-    print("=" * 70 + "\n")
-
-
-def visualize_sequence(tagged_mesh, weld_lines, sequence):
-    by_label = {wl["label"]: wl for wl in weld_lines}
-    palette = ["red", "orange", "gold", "green", "blue", "purple", "magenta", "cyan", "lime", "brown"]
-
-    pl = pv.Plotter(window_size=[1100, 850])
-    pl.add_mesh(tagged_mesh, color="lightgray", opacity=0.45)
-
-    for i, label in enumerate(sequence):
-        wl = by_label[label]
-        poly = _sample_chain_polyline(wl["chain"])
-        color = palette[i % len(palette)]
-        pl.add_lines(poly, color=color, width=6, connected=True, label=f"{i + 1}. {label}")
-        mid = poly[len(poly) // 2]
-        pl.add_point_labels([mid], [str(i + 1)], font_size=20, text_color=color, shape=None)
-
-    pl.add_legend()
-    pl.add_title("Weld Sequence (numbered in welding order)", font_size=12)
-    pl.show()
-
+    return optimal, evaluator
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Weld sequence planning for STEP assemblies")
+    parser = argparse.ArgumentParser(
+        description="Finds weld lines on a STEP assembly (same picking flow as weld_line_finder.py), "
+                     "then searches every possible weld ORDER for the one that leaves the fewest weld "
+                     "lines obstructed, accounting for the fact that a not-yet-welded part may not be "
+                     "physically present yet to block the torch.")
     parser.add_argument("--step", required=True, help="Path to input STEP assembly file")
-    parser.add_argument("--num_samples", type=int, default=9, help="Sample points per weld line")
-    parser.add_argument("--near_tol", type=float, default=0.5, help="Near-field start offset in mm")
+    parser.add_argument("--num_samples", type=int, default=None,
+                         help="Points sampled per weld line (skips the interactive prompt if given)")
+    parser.add_argument("--near_tol", type=float, default=0.5, help="Ray start offset (mm)")
+    parser.add_argument("--proximity_tol", type=float, default=2.0,
+                         help="Max distance (mm) for a face on the chosen other component to be "
+                              "accepted as a weld line's far-side face")
+    parser.add_argument("--parallel_tol_deg", type=float, default=20.0,
+                         help="For a same-component corner edge, an own-side candidate face within "
+                              "this many degrees of parallel to the resolved far-side face is treated "
+                              "as the hidden flush-contact face and eliminated")
     parser.add_argument("--minh", type=float, default=0.5, help="Gmsh min element size (mm)")
     parser.add_argument("--maxh", type=float, default=3.0, help="Gmsh max element size (mm)")
     parser.add_argument("--curvature", type=float, default=10, help="Gmsh curvature-based mesh refinement factor")
     parser.add_argument("--force_remesh", action="store_true", help="Ignore any cached mesh and re-mesh via Gmsh")
+    parser.add_argument("--max_full_enum", type=int, default=MAX_FULL_ENUMERATION,
+                         help="Max weld lines to brute-force enumerate every ordering for (exact "
+                              "search on both priorities, full per-sequence report). Above this, "
+                              "falls back to a subset-DP search that only guarantees minimizing "
+                              "total blocked rays (see run_sequence_search's docstring)")
+    parser.add_argument("--n_rings", type=int, default=None,
+                         help="Clearance ring rays per point simulating a spherical tool radius, "
+                              "used for every accessibility check in the search itself (not just "
+                              "the optional final visualization). Skips the interactive prompt "
+                              "below if given; 0 disables")
+    parser.add_argument("--clearance_radius", type=float, default=None,
+                         help="Spherical tool radius in mm for the clearance ring rays "
+                              "(only used together with --n_rings)")
+    parser.add_argument("--ring_offset", type=float, default=None,
+                         help="Forward start-point offset (mm) for clearance ring rays "
+                              "(default: clearance_radius; only used together with --n_rings)")
     args = parser.parse_args()
 
-    print("Loading STEP assembly...")
-    shape = load_step(args.step)
-    solids, faces, component_of_face = identify_components(shape)
-    print(f"Identified {len(solids)} component(s), {len(faces)} face(s) total.")
-    if len(solids) < 2:
-        raise RuntimeError(
-            "This STEP file has only one solid component -- weld sequence planning needs an "
-            "assembly of at least two separate components. Use weldfinal.py or "
-            "weldfinal_assembly.py for a single weld joint instead."
-        )
+    if args.n_rings is not None:
+        n_rings = args.n_rings
+        clearance_radius = args.clearance_radius if args.clearance_radius is not None else 5.0
+        ring_offset = args.ring_offset
+    else:
+        n_rings, clearance_radius, ring_offset = prompt_for_clearance_rings()
 
-    face_groups = find_cylinder_face_groups(faces)
+    print("Loading STEP file...")
+    shape = load_step(args.step)
+    topo = TopologyExplorer(shape)
+    solids = list(topo.solids())
+    if len(solids) <= 1:
+        raise RuntimeError(
+            "weld_sequence.py only works on assemblies (2+ separate components) -- this STEP file "
+            "has a single solid. Use weld_line_finder.py for a single-body part.")
+
+    solids, faces, component_of_face = identify_components(shape)
+    n_components = len(solids)
+    print(f"Assembly mode: {n_components} component(s), {len(faces)} face(s) total.")
+
+    face_groups = find_cylinder_face_groups(faces, component_of_face=component_of_face)
     report_cylinder_groups(face_groups)
 
     tagged_mesh = build_face_tagged_mesh(
         args.step, faces, args.minh, args.maxh, args.curvature, force_remesh=args.force_remesh)
-    add_component_ids(tagged_mesh, component_of_face)
+    lookup = np.array(component_of_face, dtype=np.int32)
+    tagged_mesh.cell_data["ComponentID"] = lookup[tagged_mesh.cell_data["FaceID"]]
 
-    topo = TopologyExplorer(shape)
+    candidate_edges, own_info = collect_candidate_edges_assembly(shape, faces, face_groups, component_of_face)
+    if not candidate_edges:
+        raise RuntimeError("No usable edges were found -- nothing to pick.")
 
-    print("\nOpening interactive window: left-click any face of the BASE component.")
-    base_component_idx = confirm_or_retry(
-        lambda: pick_component(tagged_mesh, component_of_face,
-                                "Left-click any face of the BASE component, then close the window."),
-        describe=lambda c: f"component #{c}" if c is not None else "nothing picked")
-    if base_component_idx is None:
-        raise RuntimeError("No base component was selected. Re-run and pick one.")
+    num_samples = args.num_samples if args.num_samples is not None else prompt_num_samples()
 
-    all_edges, tree, owner_of_sample = build_edge_pick_index(solids)
+    def resolve_faces_fn(chain):
+        return resolve_assembly_chain_faces(
+            tagged_mesh, faces, face_groups, component_of_face, n_components,
+            chain, candidate_edges, own_info, args.proximity_tol, args.parallel_tol_deg)
 
-    weld_lines = collect_weld_lines(
-        tagged_mesh, faces, face_groups, all_edges, tree, owner_of_sample, component_of_face, solids, topo)
+    weld_lines = find_weld_lines_interactive(
+        tagged_mesh, faces, candidate_edges, num_samples, resolve_faces_fn)
+
     if not weld_lines:
-        print("No weld lines were selected. Exiting.")
+        print("\nNo weld lines picked -- nothing to sequence.")
         return
 
-    max_dist = bbox_diagonal(tagged_mesh)
-    print(f"\nSampling and ray-casting {len(weld_lines)} weld line(s)...")
-    for wl in weld_lines:
-        compute_weld_line_rays(tagged_mesh, wl, args.num_samples)
-        precompute_hits(tagged_mesh, wl, max_dist, args.near_tol)
+    own_other = weld_own_other_components(weld_lines, component_of_face)
+    print(f"\n{len(weld_lines)} weld line(s) picked:")
+    for i, (own, other) in enumerate(own_other):
+        print(f"  {weld_label(i, own, other)}: {len(weld_lines[i]['points'])} sample point(s)")
 
-    always_infeasible, constraints = compute_precedence_constraints(weld_lines, base_component_idx)
-    feasible_labels = [wl["label"] for wl in weld_lines if wl["label"] not in always_infeasible]
-    sequence, ok = find_valid_sequence(weld_lines, constraints, base_component_idx, feasible_labels)
+    if input("\nProceed with the weld-order search on these weld line(s)? [Y/n]: ").strip().lower() in ("n", "no"):
+        print("Cancelled.")
+        return
 
-    report_sequence(weld_lines, base_component_idx, always_infeasible, constraints, sequence, ok)
+    referenced = {c for pair in own_other for c in pair}
+    baseline_present = set(range(n_components)) - referenced
+    if baseline_present:
+        print(f"[Setup] Component(s) {sorted(baseline_present)} aren't the target of any picked weld "
+              f"line -- treated as fixed context, present for every step.")
 
-    if ok:
-        visualize_sequence(tagged_mesh, weld_lines, sequence)
+    optimal, evaluator = run_sequence_search(
+        tagged_mesh, weld_lines, own_other, baseline_present, args.near_tol, args.max_full_enum,
+        n_rings=n_rings, clearance_radius=clearance_radius, ring_offset=ring_offset)
+
+    if input("\nVisualize the optimal sequence's ray casts, step by step? [y/N]: ").strip().lower() in ("y", "yes"):
+        for step in optimal["steps"]:
+            wl = weld_lines[step["weld"]]
+            print(f"\n--- {weld_label(step['weld'], *own_other[step['weld']])}: "
+                  f"present components {step['present']} ---")
+            mesh = evaluator.obstruction_mesh(step["present"])
+            visualize_weld_line_accessibility(
+                mesh, wl["chain"], wl["points"], _test_directions(wl), near_tol=args.near_tol,
+                n_rings=n_rings, clearance_radius=clearance_radius, ring_offset=ring_offset)
 
 
 if __name__ == '__main__':

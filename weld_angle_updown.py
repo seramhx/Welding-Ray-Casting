@@ -11,6 +11,8 @@ from weldfinal import (
     resolve_weld_seam,
     analyze_and_visualize_with_tolerance,
     prompt_for_clearance_rings,
+    component_id_per_face,
+    tag_component_ids,
 )
 from weldfinal_assembly import pick_edge_manually
 
@@ -60,6 +62,11 @@ def main():
 
     tagged_mesh = build_face_tagged_mesh(
         args.step, faces, args.minh, args.maxh, args.curvature, force_remesh=args.force_remesh)
+
+    component_of_face, n_components = component_id_per_face(shape, faces)
+    if n_components > 1:
+        tag_component_ids(tagged_mesh, component_of_face)
+        print(f"{n_components} component(s) detected -- shown in different colors.")
 
     print("\nOpening interactive window: left-click two adjacent faces (from either component) to select the weld joint.")
     face1, face2, face1_idx, face2_idx = pick_two_faces(tagged_mesh, faces, face_groups)

@@ -140,7 +140,7 @@ def build_face_tagged_mesh(step_path, faces, minh=0.5, maxh=3.0, curvature=10, f
 
 
 
-def find_cylinder_face_groups(faces, radius_tol=1e-3, axis_tol=1e-3):
+def find_cylinder_face_groups(faces, radius_tol=1e-3, axis_tol=1e-3, component_of_face=None):
     cyl_entries = []
     for idx, f in enumerate(faces):
         adaptor = BRepAdaptor_Surface(f, True)
@@ -168,6 +168,8 @@ def find_cylinder_face_groups(faces, radius_tol=1e-3, axis_tol=1e-3):
         for j in range(i + 1, len(cyl_entries)):
             idx_j, loc_j, dir_j, r_j = cyl_entries[j]
             if idx_j in used:
+                continue
+            if component_of_face is not None and component_of_face[idx_i] != component_of_face[idx_j]:
                 continue
             if abs(r_i - r_j) > radius_tol:
                 continue
@@ -203,9 +205,45 @@ def report_cylinder_groups(face_groups):
 
 
 
+def component_id_per_face(shape, faces):
+    """For each face in `faces` (as returned by TopologyExplorer(shape).faces()), finds which
+    solid of the shape it belongs to, by identity against each solid's own face list. Returns
+    (component_of_face, n_solids). Used to retrofit component coloring onto scripts that load
+    faces as one flat list across the whole shape without already tracking this."""
+    solids = list(TopologyExplorer(shape).solids())
+    component_of_face = [-1] * len(faces)
+    for comp_idx, solid in enumerate(solids):
+        for sf in TopologyExplorer(solid).faces():
+            for i, f in enumerate(faces):
+                if component_of_face[i] == -1 and f.IsSame(sf):
+                    component_of_face[i] = comp_idx
+                    break
+    return component_of_face, len(solids)
+
+
+def tag_component_ids(tagged_mesh, component_of_face):
+    lookup = np.array(component_of_face, dtype=np.int32)
+    tagged_mesh.cell_data["ComponentID"] = lookup[tagged_mesh.cell_data["FaceID"]]
+    return tagged_mesh
+
+
+def add_scene_mesh(pl, mesh, fallback_color="lightgray", **kwargs):
+    """Adds mesh as the scene's background/context, colored per assembly component
+    (ComponentID cell data, see tag_component_ids) if present, so an assembly's separate
+    components are visually distinguishable instead of one flat color -- or `fallback_color`
+    for a single-body part, where every face belongs to the one same component and per-
+    component coloring wouldn't show anything."""
+    if "ComponentID" in mesh.cell_data:
+        pl.add_mesh(mesh, scalars="ComponentID", cmap="tab10", show_scalar_bar=False, **kwargs)
+    else:
+        pl.add_mesh(mesh, color=fallback_color, **kwargs)
+
+
 def pick_two_faces(mesh, faces, face_groups=None, base_scalars=None, base_cmap="tab10"):
     picked_groups = []
     pl = pv.Plotter(window_size=[1100, 850])
+    if base_scalars is None and "ComponentID" in mesh.cell_data:
+        base_scalars, base_cmap = "ComponentID", "tab10"
     if base_scalars is not None:
         pl.add_mesh(mesh, scalars=base_scalars, cmap=base_cmap, show_edges=True, edge_color="dimgray",
                     show_scalar_bar=False)
@@ -327,7 +365,7 @@ def _sample_chain_polyline(chain, n_per_edge=30):
 
 def pick_edge_by_index(mesh, chains, title, chain_colors=None):
     pl = pv.Plotter(window_size=[1000, 800])
-    pl.add_mesh(mesh, color="whitesmoke", opacity=0.5)
+    add_scene_mesh(pl, mesh, fallback_color="whitesmoke", opacity=0.5)
     palette = ["magenta", "cyan", "yellow", "orange", "lime", "purple"]
 
     for i, chain in enumerate(chains):
@@ -386,6 +424,14 @@ def _face_group_owned_edges(face_or_faces):
 
 
 def _pcurve_uv(edge, face_or_faces, u_param, owned_edges_cache=None):
+    """Returns the edge's pcurve UV on whichever face in the group truly, topologically owns
+    it -- or (None, None) if none do. BRep_Tool.CurveOnSurface(edge, face) is NOT a safe way to
+    test ownership by itself: OCC returns a non-null Geom2d_Curve even for a face the edge does
+    not belong to at all (verified empirically -- it appears to compute an on-demand projection
+    rather than refusing), so calling it on an unrelated face can silently yield a plausible-
+    looking but meaningless UV, which is only harmless on a plane (any UV maps to the same
+    normal) and gives a wrong, sometimes near-constant normal on a curved surface like a
+    cylinder. True ownership is instead checked directly via the face's own topology."""
     faces = face_or_faces if isinstance(face_or_faces, (list, tuple)) else [face_or_faces]
     if owned_edges_cache is None:
         owned_edges_cache = _face_group_owned_edges(faces)
@@ -393,9 +439,9 @@ def _pcurve_uv(edge, face_or_faces, u_param, owned_edges_cache=None):
     def is_true_owner(f):
         return any(edge.IsSame(e) for e in owned_edges_cache.get(id(f), []))
 
-    ordered = [f for f in faces if is_true_owner(f)] + [f for f in faces if not is_true_owner(f)]
-
-    for face in ordered:
+    for face in faces:
+        if not is_true_owner(face):
+            continue
         try:
             curve2d, first, last = BRep_Tool.CurveOnSurface(edge, face)
         except Exception:
@@ -424,6 +470,13 @@ def _surface_point_and_normal(face, uv, fallback_pnt):
     normal_defined = bool(props.IsNormalDefined())
     if normal_defined:
         n = props.Normal()
+        # adaptor.Surface().Surface() is the RAW underlying geometry, in the surface's own local
+        # frame, ignoring the face's placement -- fine for a shape with an identity location (a
+        # lone STEP part), but silently wrong wherever the face belongs to a rotated instance
+        # within an assembly (BRep_Tool.Surface(face)/surf_handle.Value(u, v) above DO account
+        # for it, which is why the projected 3D point is correct even when this raw normal isn't).
+        # The face's own placement transform must be applied to the normal the same way.
+        n.Transform(face.Location().Transformation())
         vec = np.array([n.X(), n.Y(), n.Z()], dtype=np.float32)
         if face.Orientation() == TopAbs_REVERSED:
             vec = -vec
@@ -755,7 +808,7 @@ def _render_bisector_scene(tagged_mesh, weld_seam, pts, bis_arr, center_accessib
                             ring_accessible, ring_hit_dists, ring_origins, ring_dirs, n_rings,
                             clearance_radius, max_dist, n_accessible, draw_cap=None):
     pl = pv.Plotter(window_size=[1100, 850])
-    pl.add_mesh(tagged_mesh, color="lightgray", opacity=0.6)
+    add_scene_mesh(pl, tagged_mesh, opacity=0.6)
 
     edge_pts = _sample_chain_polyline(weld_seam)
     pl.add_lines(edge_pts, color="black", width=5, connected=True, label="Selected weld seam")
@@ -921,7 +974,7 @@ def _render_tolerance_scene(tagged_mesh, weld_seam, pts, angles_sorted, center_b
                              ring_dirs_by_angle, n_rings, clearance_radius, max_dist, all_accessible_mask,
                              n_pts, tol_deg, mode, draw_cap=None):
     pl = pv.Plotter(window_size=[1100, 850])
-    pl.add_mesh(tagged_mesh, color="lightgray", opacity=0.6)
+    add_scene_mesh(pl, tagged_mesh, opacity=0.6)
 
     edge_pts = _sample_chain_polyline(weld_seam)
     pl.add_lines(edge_pts, color="black", width=5, connected=True, label="Selected weld seam")
